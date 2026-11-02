@@ -3,23 +3,18 @@ name: Announce release on Discord
 # Posts a published firmware release to the AmpKeeper Discord server: stable
 # releases to #announcements, betas (GitHub prereleases) to #beta.
 #
-# Automatic path: the `published` event. The owner's publish_release.sh flips the
-# draft to published only after both signers succeeded, local verify-release
-# passed, and the owner confirmed the point of no return, so an announcement can
-# never precede a signed, live release.
+# Dispatch only, never on publish: esp32/announce_release.sh in the source
+# repository triggers it for one tag. publish_release.sh offers to run that once
+# the release is published and its remote verify-release has passed; run it by
+# hand for a release that was not announced then. It posts again if run twice
+# for the same tag.
 #
-# Manual path: workflow_dispatch with a tag, driven by esp32/announce_release.sh in
-# the source repository. Use it for a release that was never announced or whose
-# announcement failed. It posts again if run twice for the same tag.
-#
-# Either way the job re-reads the release from the API and refuses a tag that is
-# not a published release carrying the signed app-ampkeeper.afw bundle. The
-# webhook URLs live only in this repository's Actions secrets
+# The job re-reads the release from the API and refuses a tag that is not a
+# published release carrying the signed app-ampkeeper.afw bundle. The webhook
+# URLs live only in this repository's Actions secrets
 # DISCORD_ANNOUNCEMENTS_WEBHOOK and DISCORD_BETA_WEBHOOK.
 
 on:
-  release:
-    types: [published]
   workflow_dispatch:
     inputs:
       tag:
@@ -33,14 +28,12 @@ permissions:
 jobs:
   announce:
     name: post to Discord
-    # The rolling `manifest` release only carries versions.json; never announce it.
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event.release.tag_name != 'manifest' }}
     runs-on: ubuntu-latest
     steps:
       - name: Post the release notes
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.event.release.tag_name }}
+          TAG: ${{ inputs.tag }}
           ANNOUNCEMENTS_WEBHOOK: ${{ secrets.DISCORD_ANNOUNCEMENTS_WEBHOOK }}
           BETA_WEBHOOK: ${{ secrets.DISCORD_BETA_WEBHOOK }}
         run: |
