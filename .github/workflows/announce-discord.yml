@@ -1,0 +1,95 @@
+name: Announce release on Discord
+
+# Posts a published firmware release to the AmpKeeper Discord server: stable
+# releases to #announcements, betas (GitHub prereleases) to #beta.
+#
+# Automatic path: the `published` event. The owner's publish_release.sh flips the
+# draft to published only after both signers succeeded, local verify-release
+# passed, and the owner confirmed the point of no return, so an announcement can
+# never precede a signed, live release.
+#
+# Manual path: workflow_dispatch with a tag, driven by esp32/announce_release.sh in
+# the source repository. Use it for a release that was never announced or whose
+# announcement failed. It posts again if run twice for the same tag.
+#
+# Either way the job re-reads the release from the API and refuses a tag that is
+# not a published release carrying the signed app-ampkeeper.afw bundle. The
+# webhook URLs live only in this repository's Actions secrets
+# DISCORD_ANNOUNCEMENTS_WEBHOOK and DISCORD_BETA_WEBHOOK.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to announce (vX.Y.Z or vX.Y.Z-beta.N)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  announce:
+    name: post to Discord
+    # The rolling `manifest` release only carries versions.json; never announce it.
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.release.tag_name != 'manifest' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Post the release notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.event.release.tag_name }}
+          ANNOUNCEMENTS_WEBHOOK: ${{ secrets.DISCORD_ANNOUNCEMENTS_WEBHOOK }}
+          BETA_WEBHOOK: ${{ secrets.DISCORD_BETA_WEBHOOK }}
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-beta(\.[0-9]+)?)?$ ]]; then
+            echo "::error::'$TAG' is not a firmware release tag (vX.Y.Z or vX.Y.Z-beta.N)"
+            exit 1
+          fi
+
+          # The tags endpoint never returns a draft, so a 404 here also means "not published".
+          if ! release="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG")"; then
+            echo "::error::$TAG is not a published release in $GITHUB_REPOSITORY"
+            exit 1
+          fi
+          if ! jq -e '.draft == false and any(.assets[]; .name == "app-ampkeeper.afw")' <<<"$release" >/dev/null; then
+            echo "::error::$TAG has no signed app-ampkeeper.afw bundle - not announcing an unsigned release"
+            exit 1
+          fi
+
+          if [[ "$(jq -r '.prerelease' <<<"$release")" == "true" ]]; then
+            channel="#beta"; webhook="$BETA_WEBHOOK"; secret="DISCORD_BETA_WEBHOOK"; kind="beta firmware"
+          else
+            channel="#announcements"; webhook="$ANNOUNCEMENTS_WEBHOOK"; secret="DISCORD_ANNOUNCEMENTS_WEBHOOK"; kind="firmware"
+          fi
+          if [[ -z "$webhook" ]]; then
+            echo "::error::the $secret secret is not set, so $TAG cannot be posted to $channel"
+            exit 1
+          fi
+
+          # The changelog is hard-wrapped and Discord keeps single newlines, so join
+          # wrapped lines back into their paragraph or list item (blank lines, list
+          # markers and headings still break). Embed descriptions cap at 4096
+          # characters; the title links to the full notes.
+          payload="$(jq -n --argjson release "$release" --arg kind "$kind" '{
+            username: "AmpKeeper Releases",
+            allowed_mentions: {parse: []},
+            embeds: [{
+              title: "AmpKeeper \($kind) \($release.tag_name | ltrimstr("v")) is out",
+              url: $release.html_url,
+              description: (($release.body // "")
+                | gsub("^\\s+|\\s+$"; "")
+                | gsub("(?<=[^\\n])\\n[ \\t]*(?![\\n\\-*#>]|[0-9]+\\.)"; " ")
+                | if length > 4000 then .[:4000] + "…" else . end),
+              timestamp: $release.published_at,
+              color: 16744448
+            }]
+          }')"
+
+          curl --fail-with-body --silent --show-error --retry 3 \
+            -H 'Content-Type: application/json' -d "$payload" "$webhook?wait=true" >/dev/null
+          echo "Posted $TAG to $channel" | tee -a "$GITHUB_STEP_SUMMARY"
